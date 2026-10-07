@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import tempfile
+import threading
 import unittest
 
 from coldstore.ammonia import Monitor, level_for, validate_ppm
@@ -21,6 +22,7 @@ from coldstore.reporting import audit_export, to_csv
 from coldstore.room import RoomRegistry, validate_zone
 from coldstore.scheduler import Scheduler, validate_threshold
 from coldstore.store import (
+    MutationGate,
     Store,
     advance_epoch,
     append_command,
@@ -589,6 +591,74 @@ class ReportingCase(unittest.TestCase):
             self.assertEqual(columns, ["time", "kind", "detail", "id"])
             self.assertEqual(rows[0][1], "comp")
             self.assertEqual(rows[0][2], "2.0000")
+
+
+class MutationGateCase(unittest.TestCase):
+    def test_store_version_bumps_on_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store.open(f"{tmp}/state.json")
+            self.assertEqual(store.version, 0)
+            store.put("a", "1")
+            self.assertEqual(store.version, 1)
+            store.delete("a")
+            self.assertEqual(store.version, 2)
+            store.delete("missing")
+            self.assertEqual(store.version, 2)
+            store.clear()
+            self.assertEqual(store.version, 3)
+            store.close()
+
+    def test_freeze_waits_for_mutations_and_blocks_new_ones(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store.open(f"{tmp}/state.json")
+            gate = MutationGate()
+            store.mutation_gate = gate
+            with gate.mutation():
+                self.assertIsNone(gate.freeze(0.05))
+            freeze = gate.freeze(0.5)
+            self.assertIsNotNone(freeze)
+            store.put("own", "audit")
+            self.assertEqual(store.version, 1)
+            done = threading.Event()
+
+            def writer() -> None:
+                store.put("x", "1")
+                done.set()
+
+            thread = threading.Thread(target=writer)
+            thread.start()
+            self.assertFalse(done.wait(0.2))
+            freeze.release()
+            thread.join(2)
+            self.assertTrue(done.is_set())
+            self.assertEqual(store.version, 2)
+            store.close()
+
+    def test_nested_mutations_on_one_thread_do_not_deadlock(self) -> None:
+        gate = MutationGate()
+        with gate.mutation():
+            with gate.mutation():
+                pass
+        freeze = gate.freeze(0.05)
+        self.assertIsNotNone(freeze)
+        freeze.release()
+
+    def test_registries_bump_versions_on_mutation(self) -> None:
+        rooms = RoomRegistry()
+        self.assertEqual(rooms.version, 0)
+        rooms.add_room("r1", 1, -10.0)
+        rooms.set_temp("r1", -9.0)
+        self.assertEqual(rooms.version, 2)
+
+        bank = CompressorBank()
+        bank.add_compressor("c1", 3)
+        bank.set_stage("c1", 2)
+        self.assertEqual(bank.version, 2)
+
+        fans = FanSet()
+        fans.add_fan("f1")
+        fans.start("f1")
+        self.assertEqual(fans.version, 2)
 
 
 if __name__ == "__main__":

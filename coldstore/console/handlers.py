@@ -11,7 +11,7 @@ from coldstore.fan import PRIMARY, STANDBY
 from coldstore.load import validate_baseline as validate_load_baseline
 from coldstore.ns import Stage, control_line
 from coldstore.quota import Quota, check_quota, validate_amount
-from coldstore.reporting import audit_export, telemetry_export, to_csv
+from coldstore.reporting import audit_export, snapshot_export, telemetry_export, to_csv
 from coldstore.room import validate_zone
 from coldstore.scheduler import validate_threshold as validate_schedule_threshold
 from coldstore.store import export_state
@@ -21,12 +21,12 @@ from coldstore.valve import OPEN, validate_valve
 from . import checks, history, ops
 from . import describe as describe_module
 from . import simulate as simulate_module
-from . import snapshot as snapshot_module
 from . import telemetry as telemetry_module
 from .cycle import run_cycle
-from .http import Request, Response, csv_response, json_response, text_response
+from .http import Request, RequestError, Response, csv_response, json_response, text_response
 from .report import text_report
 from .routes import route_table
+from .snapshot import SnapshotUnavailable
 from .system import system_payload
 from .version import version_payload
 
@@ -62,8 +62,17 @@ def health_checks(server: "Server", request: Request) -> Response:
     return json_response({"checks": checks.run_checks(server.runtime)})
 
 
+def _current_snapshot(server: "Server"):
+    """The one snapshot document every reader of the plant must share."""
+
+    try:
+        return server.runtime.snapshots.current()
+    except SnapshotUnavailable as exc:
+        raise RequestError(503, str(exc)) from exc
+
+
 def snapshot(server: "Server", request: Request) -> Response:
-    return json_response(snapshot_module.collect(server.runtime))
+    return json_response(_current_snapshot(server).as_dict())
 
 
 def describe(server: "Server", request: Request) -> Response:
@@ -672,6 +681,11 @@ def export_audit(server: "Server", request: Request) -> Response:
 
 def export_telemetry(server: "Server", request: Request) -> Response:
     columns, rows = telemetry_export(telemetry_module.collect(server.runtime))
+    return csv_response(to_csv(columns, rows))
+
+
+def export_snapshot(server: "Server", request: Request) -> Response:
+    columns, rows = snapshot_export(_current_snapshot(server))
     return csv_response(to_csv(columns, rows))
 
 

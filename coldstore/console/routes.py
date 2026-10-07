@@ -27,7 +27,7 @@ def route_table() -> list[Route]:
     return [
         Route("GET", "/health", "service health and persisted keys", "health"),
         Route("GET", "/health/checks", "detailed component health checks", "health_checks"),
-        Route("GET", "/snapshot", "full component snapshot", "snapshot"),
+        Route("GET", "/snapshot", "consistent plant snapshot", "snapshot"),
         Route("GET", "/describe", "human readable component summary", "describe"),
         Route("GET", "/report", "plain text control report", "report"),
         Route("GET", "/pipeline", "control pipeline stages", "pipeline"),
@@ -125,6 +125,7 @@ def route_table() -> list[Route]:
         Route("POST", "/schedule/plan", "plan defrost order by temperature", "schedule_plan"),
         Route("GET", "/export/audit", "runtime audit trail as CSV", "export_audit"),
         Route("GET", "/export/telemetry", "telemetry counters as CSV", "export_telemetry"),
+        Route("GET", "/export/snapshot", "consistent plant snapshot as CSV", "export_snapshot"),
         Route("POST", "/cycle", "run a full control cycle", "cycle"),
         Route("POST", "/simulate", "run deterministic simulation ticks", "simulate"),
     ]

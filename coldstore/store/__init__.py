@@ -2,12 +2,14 @@
 
 from .commands import append_command, clear_commands, load_commands
 from .epoch import advance_epoch, load_float, save_float
+from .gate import MutationGate
 from .history import Event, append_event, event_count, list_events
 from .report import StoreState, describe_store, export_state, has_key, store_state
 from .store import Store
 
 __all__ = [
     "Event",
+    "MutationGate",
     "Store",
     "StoreState",
     "advance_epoch",

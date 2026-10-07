@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:  # pragma: no cover - imported only for type checkers
     from coldstore.audit import Auditor
+    from coldstore.console.snapshot import Snapshot
     from coldstore.console.telemetry import Telemetry
 
 QUOTE_TRIGGERS = (",", '"', "\n")
@@ -40,3 +42,26 @@ def telemetry_export(telemetry: Telemetry) -> tuple[list[str], list[list[object]
     """Columns and rows for the telemetry counters."""
 
     return ["metric", "value"], [[key, value] for key, value in telemetry.as_dict().items()]
+
+
+def snapshot_export(snapshot: Snapshot) -> tuple[list[str], list[list[object]]]:
+    """Columns and rows for one consistent plant snapshot.
+
+    Every row repeats the snapshot identity so the exported file stays
+    traceable to the exact document the console served.
+    """
+
+    columns = ["snapshot_id", "version", "generated_at", "segment", "available", "error", "payload"]
+    rows = [
+        [
+            snapshot.snapshot_id,
+            snapshot.tag,
+            snapshot.generated_at,
+            name,
+            snapshot.availability[name],
+            snapshot.errors.get(name, ""),
+            "" if segment is None else json.dumps(segment, ensure_ascii=False, sort_keys=True),
+        ]
+        for name, segment in snapshot.segments.items()
+    ]
+    return columns, rows

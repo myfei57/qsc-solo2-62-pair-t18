@@ -7,7 +7,10 @@ parked on standby while another takes over.
 
 from __future__ import annotations
 
+import contextlib
 import threading
+
+from coldstore.store.gate import MutationGate
 
 from .report import FanState, FanView
 
@@ -39,12 +42,31 @@ class FanSet:
     def __init__(self) -> None:
         self._fans: dict[str, FanUnit] = {}
         self._lock = threading.RLock()
+        self._version = 0
+        self.mutation_gate: MutationGate | None = None
+
+    @property
+    def version(self) -> int:
+        """Monotonic counter bumped by every fan set mutation."""
+
+        with self._lock:
+            return self._version
+
+    def _mutation(self) -> contextlib.AbstractContextManager[None]:
+        """Hold the shared mutation gate for one change, when wired."""
+
+        gate = self.mutation_gate
+        if gate is None:
+            return contextlib.nullcontext()
+        return gate.mutation()
 
     def add_fan(self, fan_id: str, role: str = STANDBY) -> FanUnit:
-        with self._lock:
-            unit = FanUnit(fan_id=fan_id, role=role)
-            self._fans[fan_id] = unit
-            return unit
+        with self._mutation():
+            with self._lock:
+                unit = FanUnit(fan_id=fan_id, role=role)
+                self._fans[fan_id] = unit
+                self._version += 1
+                return unit
 
     def fan(self, fan_id: str) -> FanUnit | None:
         with self._lock:
@@ -62,40 +84,50 @@ class FanSet:
             return len(self._fans)
 
     def start(self, fan_id: str) -> None:
-        with self._lock:
-            unit = self._require(fan_id)
-            if unit.faulted:
-                raise ValueError(f"fan {fan_id} is faulted")
-            unit.running = True
+        with self._mutation():
+            with self._lock:
+                unit = self._require(fan_id)
+                if unit.faulted:
+                    raise ValueError(f"fan {fan_id} is faulted")
+                unit.running = True
+                self._version += 1
 
     def stop(self, fan_id: str) -> None:
-        with self._lock:
-            self._require(fan_id).running = False
+        with self._mutation():
+            with self._lock:
+                self._require(fan_id).running = False
+                self._version += 1
 
     def fail(self, fan_id: str) -> None:
-        with self._lock:
-            unit = self._require(fan_id)
-            unit.faulted = True
-            unit.running = False
+        with self._mutation():
+            with self._lock:
+                unit = self._require(fan_id)
+                unit.faulted = True
+                unit.running = False
+                self._version += 1
 
     def repair(self, fan_id: str) -> None:
-        with self._lock:
-            unit = self._require(fan_id)
-            unit.faulted = False
-            if unit.role == PRIMARY:
-                unit.role = STANDBY
+        with self._mutation():
+            with self._lock:
+                unit = self._require(fan_id)
+                unit.faulted = False
+                if unit.role == PRIMARY:
+                    unit.role = STANDBY
+                self._version += 1
 
     def switch_over(self, fan_id: str) -> str:
         """Make one fan primary, demoting every other unit to standby."""
 
-        with self._lock:
-            unit = self._require(fan_id)
-            if unit.faulted:
-                raise ValueError(f"fan {fan_id} is faulted")
-            for candidate in self._fans.values():
-                candidate.role = STANDBY
-            unit.role = PRIMARY
-            return unit.id
+        with self._mutation():
+            with self._lock:
+                unit = self._require(fan_id)
+                if unit.faulted:
+                    raise ValueError(f"fan {fan_id} is faulted")
+                for candidate in self._fans.values():
+                    candidate.role = STANDBY
+                unit.role = PRIMARY
+                self._version += 1
+                return unit.id
 
     def primary(self) -> str:
         with self._lock:
@@ -127,9 +159,11 @@ class FanSet:
             return ""
 
     def stop_all(self) -> None:
-        with self._lock:
-            for unit in self._fans.values():
-                unit.running = False
+        with self._mutation():
+            with self._lock:
+                for unit in self._fans.values():
+                    unit.running = False
+                self._version += 1
 
     def state(self) -> FanState:
         fans = self.fans()

@@ -4,11 +4,15 @@ from __future__ import annotations
 
 import json
 import tempfile
+import threading
 import unittest
+import unittest.mock
 
+from coldstore.console import snapshot as snapshot_module
 from coldstore.console.routes import route_table
 from coldstore.console.seed import seed_defaults
 from coldstore.console.server import Server
+from coldstore.console.snapshot import SnapshotUnavailable
 from coldstore.store import Store
 
 
@@ -49,8 +53,9 @@ class ConsoleCase(unittest.TestCase):
 
         status, snapshot = self.call("GET", "/snapshot")
         self.assertEqual(status, 200)
+        self.assertEqual(set(snapshot), {"meta", "segments"})
         self.assertEqual(
-            set(snapshot),
+            set(snapshot["segments"]),
             {
                 "pipeline",
                 "store",
@@ -69,6 +74,12 @@ class ConsoleCase(unittest.TestCase):
                 "schedule",
             },
         )
+        meta = snapshot["meta"]
+        self.assertTrue(meta["complete"])
+        self.assertTrue(meta["audited"])
+        self.assertEqual(set(meta["availability"]), set(snapshot["segments"]))
+        self.assertTrue(all(state == "ok" for state in meta["availability"].values()))
+        self.assertEqual(meta["errors"], {})
 
         status, describe = self.call("GET", "/describe")
         self.assertEqual(status, 200)
@@ -409,6 +420,131 @@ class ConsoleCase(unittest.TestCase):
         status, body = self.call("GET", "/export/telemetry")
         self.assertIn("metric,value", body)
         self.assertIn("store_keys", body)
+
+    def test_snapshot_cached_per_version_and_audited(self) -> None:
+        status, first = self.call("GET", "/snapshot")
+        self.assertEqual(status, 200)
+        status, second = self.call("GET", "/snapshot")
+        self.assertEqual(status, 200)
+        self.assertEqual(first["meta"]["snapshot_id"], second["meta"]["snapshot_id"])
+        self.assertEqual(first["meta"]["version"], second["meta"]["version"])
+
+        status, audit = self.call("POST", "/audit/filter", {"kind": "snapshot"})
+        self.assertEqual(status, 200)
+        self.assertEqual(len(audit["entries"]), 1)
+        detail = json.loads(audit["entries"][0]["detail"])
+        self.assertEqual(detail["snapshot_id"], first["meta"]["snapshot_id"])
+        self.assertEqual(detail["version"], first["meta"]["version"])
+        self.assertEqual(detail["availability"], first["meta"]["availability"])
+        self.assertIn("description", detail)
+
+        status, _ = self.call("POST", "/temp/read", {"value": -18.0})
+        self.assertEqual(status, 200)
+        status, third = self.call("GET", "/snapshot")
+        self.assertEqual(status, 200)
+        self.assertNotEqual(third["meta"]["snapshot_id"], first["meta"]["snapshot_id"])
+        self.assertNotEqual(third["meta"]["version"], first["meta"]["version"])
+        _, audit = self.call("POST", "/audit/filter", {"kind": "snapshot"})
+        self.assertEqual(len(audit["entries"]), 2)
+
+    def test_snapshot_partial_failure_marks_segment(self) -> None:
+        def boom() -> None:
+            raise RuntimeError("bank offline")
+
+        self.server.runtime.compressors.state = boom
+        status, snapshot = self.call("GET", "/snapshot")
+        self.assertEqual(status, 200)
+        meta = snapshot["meta"]
+        self.assertFalse(meta["complete"])
+        self.assertEqual(meta["availability"]["compressors"], "unavailable")
+        self.assertEqual(meta["errors"]["compressors"], "bank offline")
+        self.assertIsNone(snapshot["segments"]["compressors"])
+        self.assertEqual(meta["availability"]["rooms"], "ok")
+        self.assertIsNotNone(snapshot["segments"]["rooms"])
+
+        status, audit = self.call("POST", "/audit/filter", {"kind": "snapshot"})
+        self.assertEqual(status, 200)
+        detail = json.loads(audit["entries"][-1]["detail"])
+        self.assertEqual(detail["availability"]["compressors"], "unavailable")
+        self.assertFalse(detail["complete"])
+
+    def test_snapshot_export_matches_console_copy(self) -> None:
+        status, snapshot = self.call("GET", "/snapshot")
+        self.assertEqual(status, 200)
+        status, csv = self.call("GET", "/export/snapshot")
+        self.assertEqual(status, 200)
+        self.assertIn("snapshot_id,version,generated_at,segment,available,error,payload", csv)
+        self.assertIn(snapshot["meta"]["snapshot_id"], csv)
+        self.assertIn(snapshot["meta"]["version"], csv)
+        self.assertIn("compressors", csv)
+        self.assertIn("schedule", csv)
+
+    def test_snapshot_consistent_under_concurrent_writes(self) -> None:
+        self.add_room("r1", 1, -20.0)
+        status, _ = self.call("POST", "/comp/add", {"id": "c1", "stages": 4})
+        self.assertEqual(status, 200)
+        stop = threading.Event()
+
+        def writer() -> None:
+            count = 0
+            while not stop.is_set():
+                count += 1
+                self.call("POST", "/temp/read", {"value": -18.0 + (count % 5) * 0.1})
+                self.call("POST", "/comp/stage", {"id": "c1", "stage": count % 4})
+
+        threads = [threading.Thread(target=writer) for _ in range(3)]
+        for thread in threads:
+            thread.start()
+        try:
+            for _ in range(30):
+                status, snapshot = self.call("GET", "/snapshot")
+                self.assertEqual(status, 200)
+                self.assertIn("version", snapshot["meta"])
+        finally:
+            stop.set()
+            for thread in threads:
+                thread.join()
+
+        status, snapshot = self.call("GET", "/snapshot")
+        self.assertEqual(status, 200)
+        stage, _ = self.server.runtime.compressors.stage("c1")
+        self.assertEqual(snapshot["segments"]["compressors"]["compressors"][0]["stage"], stage)
+        self.assertEqual(snapshot["segments"]["temp"]["value"], self.server.runtime.temp.current())
+
+    def test_snapshot_refused_when_generation_exceeds_budget(self) -> None:
+        with unittest.mock.patch.object(
+            self.server.runtime.snapshots,
+            "current",
+            side_effect=SnapshotUnavailable("plant stayed busy"),
+        ):
+            status, body = self.call("GET", "/snapshot")
+            self.assertEqual(status, 503)
+            self.assertIn("busy", body["error"])
+            status, body = self.call("GET", "/export/snapshot")
+            self.assertEqual(status, 503)
+            self.assertIn("busy", body["error"])
+
+    def test_snapshot_refused_when_every_segment_fails(self) -> None:
+        def broken() -> list[tuple[str, object]]:
+            return [("pipeline", lambda rt: (_ for _ in ()).throw(RuntimeError("down")))]
+
+        with unittest.mock.patch.object(snapshot_module, "segment_readers", broken):
+            status, body = self.call("GET", "/snapshot")
+            self.assertEqual(status, 503)
+            self.assertIn("every segment", body["error"])
+
+    def test_snapshot_freezes_after_optimistic_attempts_drift(self) -> None:
+        original = snapshot_module._read_store
+
+        def drifting(rt):
+            rt.store.put("snapshot:probe", "x")
+            return original(rt)
+
+        with unittest.mock.patch.object(snapshot_module, "_read_store", drifting):
+            status, snapshot = self.call("GET", "/snapshot")
+        self.assertEqual(status, 200)
+        self.assertTrue(snapshot["meta"]["frozen"])
+        self.assertEqual(snapshot["meta"]["attempts"], 4)
 
     def test_metrics_and_errors(self) -> None:
         self.call("GET", "/health")

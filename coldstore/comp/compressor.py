@@ -8,7 +8,10 @@ when the console serves them from separate threads.
 
 from __future__ import annotations
 
+import contextlib
 import threading
+
+from coldstore.store.gate import MutationGate
 
 from .report import BankState, CompressorView
 
@@ -38,12 +41,31 @@ class Bank:
         self._compressors: dict[str, Compressor] = {}
         self._reservations: dict[str, str] = {}
         self._lock = threading.RLock()
+        self._version = 0
+        self.mutation_gate: MutationGate | None = None
+
+    @property
+    def version(self) -> int:
+        """Monotonic counter bumped by every bank mutation."""
+
+        with self._lock:
+            return self._version
+
+    def _mutation(self) -> contextlib.AbstractContextManager[None]:
+        """Hold the shared mutation gate for one change, when wired."""
+
+        gate = self.mutation_gate
+        if gate is None:
+            return contextlib.nullcontext()
+        return gate.mutation()
 
     def add_compressor(self, comp_id: str, stages: int) -> Compressor:
-        with self._lock:
-            compressor = Compressor(comp_id=comp_id, stages=stages)
-            self._compressors[comp_id] = compressor
-            return compressor
+        with self._mutation():
+            with self._lock:
+                compressor = Compressor(comp_id=comp_id, stages=stages)
+                self._compressors[comp_id] = compressor
+                self._version += 1
+                return compressor
 
     def compressor(self, comp_id: str) -> Compressor | None:
         with self._lock:
@@ -61,49 +83,61 @@ class Bank:
             return len(self._compressors)
 
     def remove(self, comp_id: str) -> None:
-        with self._lock:
-            if comp_id not in self._compressors:
-                raise ValueError(f"compressor {comp_id} not found")
-            del self._compressors[comp_id]
-            self._reservations.pop(comp_id, None)
+        with self._mutation():
+            with self._lock:
+                if comp_id not in self._compressors:
+                    raise ValueError(f"compressor {comp_id} not found")
+                del self._compressors[comp_id]
+                self._reservations.pop(comp_id, None)
+                self._version += 1
 
     def stage_up(self, comp_id: str) -> int:
-        with self._lock:
-            compressor = self._require(comp_id)
-            if compressor.stage < compressor.stages:
-                compressor.stage += 1
-            compressor.running = compressor.stage > 0
-            return compressor.stage
+        with self._mutation():
+            with self._lock:
+                compressor = self._require(comp_id)
+                if compressor.stage < compressor.stages:
+                    compressor.stage += 1
+                compressor.running = compressor.stage > 0
+                self._version += 1
+                return compressor.stage
 
     def stage_down(self, comp_id: str) -> int:
-        with self._lock:
-            compressor = self._require(comp_id)
-            if compressor.stage > 0:
-                compressor.stage -= 1
-            compressor.running = compressor.stage > 0
-            return compressor.stage
+        with self._mutation():
+            with self._lock:
+                compressor = self._require(comp_id)
+                if compressor.stage > 0:
+                    compressor.stage -= 1
+                compressor.running = compressor.stage > 0
+                self._version += 1
+                return compressor.stage
 
     def set_stage(self, comp_id: str, stage: int) -> int:
-        with self._lock:
-            compressor = self._require(comp_id)
-            if stage < 0 or stage > compressor.stages:
-                raise ValueError(f"stage must be between 0 and {compressor.stages}")
-            compressor.stage = stage
-            compressor.running = stage > 0
-            return stage
+        with self._mutation():
+            with self._lock:
+                compressor = self._require(comp_id)
+                if stage < 0 or stage > compressor.stages:
+                    raise ValueError(f"stage must be between 0 and {compressor.stages}")
+                compressor.stage = stage
+                compressor.running = stage > 0
+                self._version += 1
+                return stage
 
     def start(self, comp_id: str) -> None:
-        with self._lock:
-            compressor = self._require(comp_id)
-            if compressor.stage == 0:
-                compressor.stage = 1
-            compressor.running = True
+        with self._mutation():
+            with self._lock:
+                compressor = self._require(comp_id)
+                if compressor.stage == 0:
+                    compressor.stage = 1
+                compressor.running = True
+                self._version += 1
 
     def stop(self, comp_id: str) -> None:
-        with self._lock:
-            compressor = self._require(comp_id)
-            compressor.stage = 0
-            compressor.running = False
+        with self._mutation():
+            with self._lock:
+                compressor = self._require(comp_id)
+                compressor.stage = 0
+                compressor.running = False
+                self._version += 1
 
     def stage(self, comp_id: str) -> tuple[int, bool]:
         with self._lock:
@@ -139,22 +173,26 @@ class Bank:
     def reserve(self, comp_id: str, room_id: str) -> str:
         """Give one room exclusive use of a compressor."""
 
-        with self._lock:
-            self._require(comp_id)
-            holder = self._reservations.get(comp_id)
-            if holder is not None and holder != room_id:
-                raise ValueError(f"compressor {comp_id} already reserved by {holder}")
-            self._reservations[comp_id] = room_id
-            return room_id
+        with self._mutation():
+            with self._lock:
+                self._require(comp_id)
+                holder = self._reservations.get(comp_id)
+                if holder is not None and holder != room_id:
+                    raise ValueError(f"compressor {comp_id} already reserved by {holder}")
+                self._reservations[comp_id] = room_id
+                self._version += 1
+                return room_id
 
     def release(self, comp_id: str, room_id: str) -> None:
-        with self._lock:
-            holder = self._reservations.get(comp_id)
-            if holder is None:
-                return
-            if holder != room_id:
-                raise ValueError(f"compressor {comp_id} reserved by {holder}")
-            del self._reservations[comp_id]
+        with self._mutation():
+            with self._lock:
+                holder = self._reservations.get(comp_id)
+                if holder is None:
+                    return
+                if holder != room_id:
+                    raise ValueError(f"compressor {comp_id} reserved by {holder}")
+                del self._reservations[comp_id]
+                self._version += 1
 
     def reserved_by(self, comp_id: str) -> str:
         with self._lock:

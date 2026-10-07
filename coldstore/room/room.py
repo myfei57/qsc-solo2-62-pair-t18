@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import contextlib
 import threading
+
+from coldstore.store.gate import MutationGate
 
 from .report import RoomState, RoomView
 
@@ -46,12 +49,31 @@ class RoomRegistry:
     def __init__(self) -> None:
         self._rooms: dict[str, Room] = {}
         self._lock = threading.RLock()
+        self._version = 0
+        self.mutation_gate: MutationGate | None = None
+
+    @property
+    def version(self) -> int:
+        """Monotonic counter bumped by every registry mutation."""
+
+        with self._lock:
+            return self._version
+
+    def _mutation(self) -> contextlib.AbstractContextManager[None]:
+        """Hold the shared mutation gate for one change, when wired."""
+
+        gate = self.mutation_gate
+        if gate is None:
+            return contextlib.nullcontext()
+        return gate.mutation()
 
     def add_room(self, room_id: str, zone: int, temp: float = 0.0) -> Room:
-        with self._lock:
-            room = Room(room_id=room_id, zone=zone, temp=temp)
-            self._rooms[room_id] = room
-            return room
+        with self._mutation():
+            with self._lock:
+                room = Room(room_id=room_id, zone=zone, temp=temp)
+                self._rooms[room_id] = room
+                self._version += 1
+                return room
 
     def room(self, room_id: str) -> Room | None:
         with self._lock:
@@ -69,34 +91,46 @@ class RoomRegistry:
             return len(self._rooms)
 
     def remove_room(self, room_id: str) -> None:
-        with self._lock:
-            if room_id not in self._rooms:
-                raise ValueError(f"cold room {room_id} not found")
-            del self._rooms[room_id]
+        with self._mutation():
+            with self._lock:
+                if room_id not in self._rooms:
+                    raise ValueError(f"cold room {room_id} not found")
+                del self._rooms[room_id]
+                self._version += 1
 
     def set_temp(self, room_id: str, temp: float) -> None:
-        with self._lock:
-            self._require(room_id).temp = temp
+        with self._mutation():
+            with self._lock:
+                self._require(room_id).temp = temp
+                self._version += 1
 
     def set_defrosting(self, room_id: str, value: bool) -> None:
-        with self._lock:
-            self._require(room_id).defrosting = value
+        with self._mutation():
+            with self._lock:
+                self._require(room_id).defrosting = value
+                self._version += 1
 
     def reset_defrosting(self) -> None:
-        with self._lock:
-            for room in self._rooms.values():
-                room.defrosting = False
+        with self._mutation():
+            with self._lock:
+                for room in self._rooms.values():
+                    room.defrosting = False
+                self._version += 1
 
     def defrosting_ids(self) -> list[str]:
         return [room.id for room in self.rooms() if room.defrosting]
 
     def assign_compressor(self, room_id: str, compressor: str) -> None:
-        with self._lock:
-            self._require(room_id).compressor = compressor
+        with self._mutation():
+            with self._lock:
+                self._require(room_id).compressor = compressor
+                self._version += 1
 
     def assign_sensor(self, room_id: str, sensor: str) -> None:
-        with self._lock:
-            self._require(room_id).sensor = sensor
+        with self._mutation():
+            with self._lock:
+                self._require(room_id).sensor = sensor
+                self._version += 1
 
     def assignment(self, room_id: str) -> tuple[str, str, bool]:
         """Return the compressor and ammonia sensor bound to a room."""
@@ -115,8 +149,10 @@ class RoomRegistry:
         ]
 
     def renumber(self, room_id: str, zone: int) -> None:
-        with self._lock:
-            self._require(room_id).zone = zone
+        with self._mutation():
+            with self._lock:
+                self._require(room_id).zone = zone
+                self._version += 1
 
     def mapping(self) -> dict[int, str]:
         """Zone to room identifier, rebuilt from the live registry."""
