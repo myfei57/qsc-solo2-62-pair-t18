@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+import json
+from collections.abc import Iterator, Sequence
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:  # pragma: no cover - imported only for type checkers
     from coldstore.audit import Auditor
+    from coldstore.console.coordinator import SnapshotDocument
     from coldstore.console.telemetry import Telemetry
 
 QUOTE_TRIGGERS = (",", '"', "\n")
@@ -40,3 +42,36 @@ def telemetry_export(telemetry: Telemetry) -> tuple[list[str], list[list[object]
     """Columns and rows for the telemetry counters."""
 
     return ["metric", "value"], [[key, value] for key, value in telemetry.as_dict().items()]
+
+
+def _flatten(prefix: str, value: object) -> Iterator[tuple[str, object]]:
+    if isinstance(value, dict):
+        if not value:
+            yield prefix, "{}"
+        for key in sorted(value):
+            yield from _flatten(f"{prefix}.{key}", value[key])
+    elif isinstance(value, list):
+        yield prefix, json.dumps(value, ensure_ascii=False)
+    else:
+        yield prefix, value
+
+
+def snapshot_export(document: SnapshotDocument) -> tuple[list[str], list[list[object]]]:
+    """Columns and rows for one cached consistent snapshot document."""
+
+    rows: list[list[object]] = [
+        ["meta", "version", document.version],
+        ["meta", "generated_at", document.generated_at],
+        ["meta", "partial", document.partial],
+    ]
+    for name, state in document.availability.items():
+        marker = "available" if state.available else f"unavailable: {state.error}"
+        rows.append(["availability", name, marker])
+    for name, line in document.describe.items():
+        rows.append(["describe", name, line])
+    for name, payload in document.segments.items():
+        if payload is None:
+            continue
+        for key, value in _flatten(f"segments.{name}", payload):
+            rows.append(["segment", key, value])
+    return ["section", "key", "value"], rows

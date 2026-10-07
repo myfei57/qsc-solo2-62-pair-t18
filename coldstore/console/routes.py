@@ -125,6 +125,7 @@ def route_table() -> list[Route]:
         Route("POST", "/schedule/plan", "plan defrost order by temperature", "schedule_plan"),
         Route("GET", "/export/audit", "runtime audit trail as CSV", "export_audit"),
         Route("GET", "/export/telemetry", "telemetry counters as CSV", "export_telemetry"),
+        Route("GET", "/export/snapshot", "consistent plant snapshot as CSV", "export_snapshot"),
         Route("POST", "/cycle", "run a full control cycle", "cycle"),
         Route("POST", "/simulate", "run deterministic simulation ticks", "simulate"),
     ]

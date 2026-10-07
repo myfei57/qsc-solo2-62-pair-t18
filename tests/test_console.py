@@ -49,26 +49,31 @@ class ConsoleCase(unittest.TestCase):
 
         status, snapshot = self.call("GET", "/snapshot")
         self.assertEqual(status, 200)
-        self.assertEqual(
-            set(snapshot),
-            {
-                "pipeline",
-                "store",
-                "rooms",
-                "compressors",
-                "supply",
-                "temp",
-                "ammonia",
-                "interlock",
-                "cold_fans",
-                "evap",
-                "defrost",
-                "load",
-                "quota",
-                "audit",
-                "schedule",
-            },
+        segments = {
+            "pipeline",
+            "store",
+            "rooms",
+            "compressors",
+            "supply",
+            "temp",
+            "ammonia",
+            "interlock",
+            "cold_fans",
+            "evap",
+            "defrost",
+            "load",
+            "quota",
+            "audit",
+            "schedule",
+        }
+        self.assertEqual(set(snapshot["segments"]), segments)
+        self.assertEqual(set(snapshot["availability"]), segments)
+        self.assertTrue(
+            all(state["available"] for state in snapshot["availability"].values())
         )
+        self.assertFalse(snapshot["partial"])
+        self.assertIsInstance(snapshot["version"], int)
+        self.assertEqual(set(snapshot["describe"]), segments)
 
         status, describe = self.call("GET", "/describe")
         self.assertEqual(status, 200)

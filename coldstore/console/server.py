@@ -11,6 +11,27 @@ from .http import Request, RequestError, Response, Router, build_request, error_
 from .metrics import Metrics
 from .routes import register_routes
 from .runtime import Runtime
+from .snapshot import build_coordinator
+
+# POST routes that only read state; everything else non-GET is a mutation
+# and must pass the snapshot freeze gate and advance the state version.
+READ_ONLY_POSTS = frozenset(
+    {
+        "/room/lookup",
+        "/comp/lookup",
+        "/fan/lookup",
+        "/audit/filter",
+        "/quota/check",
+        "/quota/remaining",
+        "/load/estimate",
+        "/schedule/plan",
+        "/defrost/select",
+    }
+)
+
+
+def _is_mutation(request: Request) -> bool:
+    return request.method != "GET" and request.path not in READ_ONLY_POSTS
 
 
 class Server:
@@ -20,6 +41,7 @@ class Server:
         self.runtime = Runtime(store)
         self.router = Router()
         self.metrics = Metrics()
+        self.snapshots = build_coordinator(self.runtime)
         register_routes(self.router, handlers)
 
     def respond(self, request: Request) -> Response:
@@ -35,6 +57,17 @@ class Server:
                     405, f"method {request.method} not allowed for {request.path}"
                 )
             return error_response(404, f"no route for {request.path}")
+        if _is_mutation(request):
+            with self.snapshots.mutation():
+                response = self._invoke(handler, request)
+                # 4xx means the request was rejected before committing;
+                # anything else may have changed state, so bump the version.
+                if response.status < 400 or response.status >= 500:
+                    self.snapshots.note_mutation()
+            return response
+        return self._invoke(handler, request)
+
+    def _invoke(self, handler, request: Request) -> Response:
         try:
             return handler(self, request)
         except RequestError as exc:

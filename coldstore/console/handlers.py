@@ -11,7 +11,7 @@ from coldstore.fan import PRIMARY, STANDBY
 from coldstore.load import validate_baseline as validate_load_baseline
 from coldstore.ns import Stage, control_line
 from coldstore.quota import Quota, check_quota, validate_amount
-from coldstore.reporting import audit_export, telemetry_export, to_csv
+from coldstore.reporting import audit_export, snapshot_export, telemetry_export, to_csv
 from coldstore.room import validate_zone
 from coldstore.scheduler import validate_threshold as validate_schedule_threshold
 from coldstore.store import export_state
@@ -21,10 +21,10 @@ from coldstore.valve import OPEN, validate_valve
 from . import checks, history, ops
 from . import describe as describe_module
 from . import simulate as simulate_module
-from . import snapshot as snapshot_module
 from . import telemetry as telemetry_module
+from .coordinator import SnapshotDocument, SnapshotUnavailable, SnapshotVersionUnknown
 from .cycle import run_cycle
-from .http import Request, Response, csv_response, json_response, text_response
+from .http import Request, RequestError, Response, csv_response, json_response, text_response
 from .report import text_report
 from .routes import route_table
 from .system import system_payload
@@ -62,8 +62,36 @@ def health_checks(server: "Server", request: Request) -> Response:
     return json_response({"checks": checks.run_checks(server.runtime)})
 
 
+def _requested_version(request: Request) -> int | None:
+    """Explicit snapshot version from the JSON body or the query string."""
+
+    raw = request.payload.get("version")
+    if raw is None:
+        values = request.query.get("version")
+        raw = values[0] if values else None
+    if raw is None:
+        return None
+    if isinstance(raw, bool) or (isinstance(raw, float) and not raw.is_integer()):
+        raise RequestError(400, "version must be an integer")
+    try:
+        return int(raw)
+    except (TypeError, ValueError) as exc:
+        raise RequestError(400, "version must be an integer") from exc
+
+
+def _snapshot_document(server: "Server", request: Request) -> SnapshotDocument:
+    """Resolve the cached snapshot or map a whole-snapshot failure."""
+
+    try:
+        return server.snapshots.document(_requested_version(request))
+    except SnapshotVersionUnknown as exc:
+        raise RequestError(404, str(exc)) from exc
+    except SnapshotUnavailable as exc:
+        raise RequestError(503, str(exc)) from exc
+
+
 def snapshot(server: "Server", request: Request) -> Response:
-    return json_response(snapshot_module.collect(server.runtime))
+    return json_response(_snapshot_document(server, request).as_dict())
 
 
 def describe(server: "Server", request: Request) -> Response:
@@ -672,6 +700,13 @@ def export_audit(server: "Server", request: Request) -> Response:
 
 def export_telemetry(server: "Server", request: Request) -> Response:
     columns, rows = telemetry_export(telemetry_module.collect(server.runtime))
+    return csv_response(to_csv(columns, rows))
+
+
+def export_snapshot(server: "Server", request: Request) -> Response:
+    """CSV rendering of the same cached document the console serves."""
+
+    columns, rows = snapshot_export(_snapshot_document(server, request))
     return csv_response(to_csv(columns, rows))
 
 
